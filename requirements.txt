@@ -4,3 +4,4 @@ transformers
 peft
 accelerate
 safetensors
+gunicorn
