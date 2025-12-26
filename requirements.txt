@@ -5,3 +5,5 @@ peft
 accelerate
 safetensors
 gunicorn
+protobuf
+sentencepiece
