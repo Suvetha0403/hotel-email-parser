@@ -5,4 +5,6 @@ bitsandbytes
 accelerate
 fastapi
 uvicorn
+gunicorn
 sentencepiece
+
