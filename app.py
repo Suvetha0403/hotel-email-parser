@@ -16,7 +16,7 @@ if not HF_TOKEN:
 # Model paths
 # -----------------------------
 BASE_MODEL = "meta-llama/Llama-3.2-3B-Instruct"
-LORA_PATH = "."  # LoRA files in root folder
+LORA_REPO = "suvetha04/llama3.2-lora-hotel-parser"
 
 # -----------------------------
 # Load tokenizer
