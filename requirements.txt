@@ -1,9 +1,8 @@
-flask
 torch
-transformers
+transformers>=4.33
 peft
+bitsandbytes
 accelerate
-safetensors
-gunicorn
-protobuf
+fastapi
+uvicorn
 sentencepiece
