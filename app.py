@@ -1,149 +1,108 @@
 import os
-import json
-import re
 import torch
-
-from flask import Flask, request, render_template_string
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from fastapi import FastAPI
+from pydantic import BaseModel
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from peft import PeftModel
 
 # -----------------------------
-# Flask App
+# Hugging Face Token (optional)
 # -----------------------------
-app = Flask(__name__)
+HF_TOKEN = os.environ.get("HF_TOKEN")
+if not HF_TOKEN:
+    print("⚠️ HF_TOKEN not set, assuming public model access")
 
 # -----------------------------
-# Environment Variables
-# -----------------------------
-HF_TOKEN = os.environ.get("HF_TOKEN")  # MUST be set in Render
-
-# -----------------------------
-# Model Configuration
+# Model paths
 # -----------------------------
 BASE_MODEL = "meta-llama/Llama-3.2-3B-Instruct"
-LORA_REPO = "suvetha04/llama3.2-lora-hotel-parser"
+LORA_PATH = "."  # LoRA files in root folder
 
 # -----------------------------
-# Load Model ONCE (IMPORTANT)
+# Load tokenizer
 # -----------------------------
-print("🚀 Loading tokenizer...")
+print("🔄 Loading tokenizer...")
 tokenizer = AutoTokenizer.from_pretrained(
-    LORA_REPO,
-    token=HF_TOKEN
+    BASE_MODEL,
+    use_auth_token=HF_TOKEN if HF_TOKEN else None
 )
 
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
-print("🚀 Loading base model...")
-base_model = AutoModelForCausalLM.from_pretrained(
-    BASE_MODEL,
-    token=HF_TOKEN,
-    device_map="auto",
-    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+# -----------------------------
+# 4-bit quantization config
+# -----------------------------
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_compute_dtype=torch.float16,  # Use float16 compute for efficiency
+    bnb_4bit_use_double_quant=True
 )
 
-print("🚀 Loading LoRA adapter...")
-model = PeftModel.from_pretrained(
-    base_model,
-    LORA_REPO,
-    token=HF_TOKEN
-)
+# -----------------------------
+# Load base model in 4-bit
+# -----------------------------
+print("🔄 Loading base model in 4-bit (GPU recommended)...")
+try:
+    base_model = AutoModelForCausalLM.from_pretrained(
+        BASE_MODEL,
+        quantization_config=bnb_config,
+        device_map="auto",  # GPU preferred
+        use_auth_token=HF_TOKEN if HF_TOKEN else None
+    )
+except Exception as e:
+    print("❌ Failed to load 4-bit model:", e)
+    raise RuntimeError("4-bit model may be too large for free CPU. GPU recommended.")
 
+# -----------------------------
+# Load LoRA adapter
+# -----------------------------
+print("🔄 Loading LoRA adapter...")
+model = PeftModel.from_pretrained(base_model, LORA_PATH)
 model.eval()
-print("✅ Model loaded successfully")
+print("✅ Base model + LoRA adapter loaded successfully")
 
 # -----------------------------
-# HTML UI
+# FastAPI app
 # -----------------------------
-HTML_TEMPLATE = """
-<!doctype html>
-<title>Hotel Email Parser</title>
+app = FastAPI(title="Hotel Email Parser API (4-bit)")
 
-<h2>🏨 Hotel Email Parser</h2>
+class EmailRequest(BaseModel):
+    subject: str
+    body: str
 
-<form method="POST">
-  <label><b>Subject:</b></label><br>
-  <input type="text" name="subject" size="100" required><br><br>
+# -----------------------------
+# Health check endpoint
+# -----------------------------
+@app.get("/health")
+def health():
+    return {"status": "ok", "device": "cuda" if torch.cuda.is_available() else "cpu"}
 
-  <label><b>Email Body:</b></label><br>
-  <textarea name="body" rows="12" cols="100" required></textarea><br><br>
+# -----------------------------
+# Prediction endpoint
+# -----------------------------
+@app.post("/predict")
+def predict(data: EmailRequest):
+    prompt = f"""
+Extract booking details from this email and return JSON only.
 
-  <input type="submit" value="Process Email"
-         style="font-size:16px;padding:10px 20px;">
-</form>
+Subject: {data.subject}
+Email: {data.body}
 
-{% if result %}
-<hr>
-<h3>📄 Extracted JSON</h3>
-<pre>{{ result }}</pre>
-{% endif %}
+JSON:
 """
-
-# -----------------------------
-# JSON Extractor
-# -----------------------------
-def extract_json(text):
-    try:
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        if match:
-            return json.loads(match.group())
-    except Exception as e:
-        return {"error": str(e)}
-    return {}
-
-# -----------------------------
-# Routes
-# -----------------------------
-@app.route("/", methods=["GET", "POST"])
-def home():
-    result = None
-
-    if request.method == "POST":
-        subject = request.form.get("subject", "")
-        body = request.form.get("body", "")
-
-        prompt = f"""
-### Instruction:
-Classify this hotel-related email and extract details as JSON.
-
-### Input:
-Subject: {subject}
-
-Body:
-{body}
-
-### Output:
-"""
-
-        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-
+    device = next(model.parameters()).device
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    with torch.no_grad():
         outputs = model.generate(
             **inputs,
-            max_new_tokens=300,
-            do_sample=False,
-            temperature=0.0,
-            eos_token_id=tokenizer.eos_token_id
+            max_new_tokens=256,
+            temperature=0.1,
+            do_sample=False
         )
+    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-        generated = outputs[0][inputs["input_ids"].shape[-1]:]
-        text = tokenizer.decode(generated, skip_special_tokens=True)
-
-        parsed = extract_json(text)
-        result = json.dumps(parsed, indent=2)
-
-    return render_template_string(HTML_TEMPLATE, result=result)
-
-# -----------------------------
-# Health Check
-# -----------------------------
-@app.route("/health")
-def health():
-    return "OK"
-
-# -----------------------------
-# Run App (Render Compatible)
-# -----------------------------
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    return {
+        "subject": data.subject,
+        "parsed_output": response
+    }
